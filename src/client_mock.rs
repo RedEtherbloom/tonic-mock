@@ -209,6 +209,7 @@ mock.reset().await;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, header::HeaderValue};
 use prost::Message;
+use tower::util::ServiceFn;
 use std::{
     marker::PhantomData,
     sync::{Arc, Mutex},
@@ -429,6 +430,7 @@ type PredicateFn<Req> = Arc<dyn Fn(&Req) -> bool + Send + Sync>;
 #[derive(Clone, Default)]
 pub struct MockableGrpcClient {
     handlers: Arc<Mutex<Vec<MockHandler>>>,
+    better_handlers: Arc<Mutex<Vec<BetterMockHandler>>>,
 }
 
 /// Abstract handler type that doesn't expose generic parameters
@@ -439,6 +441,13 @@ enum MockHandler {
         method: String,
         handler: Box<dyn Fn(&[u8]) -> Result<(Bytes, HeaderMap), Status> + Send + Sync>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct BetterMockHandler {
+    service_name: String,
+    method_name: String,
+    service: ServiceFn<Box<Fn(Box<dyn Message>) -> Box<dyn Future<Output = Result<Box<dyn Message>, Status>>>>>,
 }
 
 impl MockableGrpcClient {
@@ -508,6 +517,7 @@ impl MockableGrpcClient {
     pub async fn reset(&self) {
         let mut handlers = self.handlers.lock().unwrap();
         handlers.clear();
+        self.better_handlers.lock().unwrap().clear();
     }
 
     /// Handle a gRPC request
@@ -598,6 +608,15 @@ impl MockableGrpcClient {
             method: method_name,
             handler: Box::new(handler),
         });
+    }
+
+    /// Register a handler function for a specific service and method
+    async fn register_better_handler<F>(&self, service_name: String, method_name: String, handler: F)
+    where
+    F: Fn(Box<dyn Message>) -> Box<dyn Future<Output = Result<Box<dyn Message>, Status>>>
+    {
+        let mut better_handlers = self.better_handlers.lock().unwrap();
+        better_handlers.push(BetterMockHandler{service_name,method_name,service:         Box::new(tower::util::service_fn(Box::new(handler)))})
     }
 }
 
