@@ -207,16 +207,17 @@ mock.reset().await;
 */
 
 use bytes::Bytes;
+use futures::FutureExt;
 use http::{HeaderMap, HeaderName, header::HeaderValue};
 use prost::Message;
-use tower::util::ServiceFn;
 use std::{
-    marker::PhantomData,
-    sync::{Arc, Mutex},
-    time::Duration,
+    marker::PhantomData, sync::{Arc, Mutex}, time::Duration
 };
 use tokio::time::sleep;
-use tonic::Status;
+use tonic::{GrpcMethod, Status, metadata::MetadataMap};
+use tonic::codegen::BoxFuture;
+use tower::Service;
+use http_body_util::{BodyExt, Full};
 
 use crate::grpc_mock::{decode_grpc_message, encode_grpc_response};
 
@@ -430,7 +431,11 @@ type PredicateFn<Req> = Arc<dyn Fn(&Req) -> bool + Send + Sync>;
 #[derive(Clone, Default)]
 pub struct MockableGrpcClient {
     handlers: Arc<Mutex<Vec<MockHandler>>>,
-    better_handlers: Arc<Mutex<Vec<BetterMockHandler>>>,
+}
+
+#[derive(Default)]
+pub struct BetterMockableGrpcClient {
+    handlers: Vec<BetterMockHandler>,
 }
 
 /// Abstract handler type that doesn't expose generic parameters
@@ -443,13 +448,22 @@ enum MockHandler {
     },
 }
 
-#[derive(Clone, Debug)]
-pub struct BetterMockHandler {
-    service_name: String,
-    method_name: String,
-    service: ServiceFn<Box<Fn(Box<dyn Message>) -> Box<dyn Future<Output = Result<Box<dyn Message>, Status>>>>>,
+// TODO: Debug impl
+struct BetterMockHandler {
+    pub service_name: String,
+    pub method_name: String,
+    // TODO: Turn into an either or
+    /// Additional metadata as key-value pairs
+    pub metadata: MetadataMap,
+    /// Delay in ms before responding (simulates network latency)
+    pub delay: Option<u64>,
+
+    // TODO: Constrain to Send + Sync
+    // TODO: Turn into service
+    pub inner: Box<dyn Service<tonic::Request<tonic::body::Body>, Response = tonic::Response<tonic::body::Body>, Error = Status, Future = BoxFuture<tonic::Response<tonic::body::Body>, Status>> + Send + Sync>,
 }
 
+// TODO: Impl from MockResponseDefinition
 impl MockableGrpcClient {
     /// Create a new mockable gRPC client
     pub fn new() -> Self {
@@ -517,7 +531,6 @@ impl MockableGrpcClient {
     pub async fn reset(&self) {
         let mut handlers = self.handlers.lock().unwrap();
         handlers.clear();
-        self.better_handlers.lock().unwrap().clear();
     }
 
     /// Handle a gRPC request
@@ -597,7 +610,6 @@ impl MockableGrpcClient {
         handler_result
     }
 
-    /// Register a handler function for a specific service and method
     async fn register_handler<F>(&self, service_name: String, method_name: String, handler: F)
     where
         F: Fn(&[u8]) -> Result<(Bytes, HeaderMap), Status> + Send + Sync + 'static,
@@ -609,14 +621,101 @@ impl MockableGrpcClient {
             handler: Box::new(handler),
         });
     }
+}
+
+impl BetterMockableGrpcClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        self.handlers.clear();
+    }
+
+    /// Handle a gRPC request
+    ///
+    /// This method is used internally by client implementations to handle
+    /// mock requests. It looks up the appropriate handler for the service
+    /// and method and delegates to it.
+    ///
+    /// # Arguments
+    /// * `service_name` - The name of the gRPC service
+    /// * `method_name` - The name of the method being called
+    /// * `request_bytes` - The encoded request message
+    ///
+    /// # Returns
+    /// The encoded response and any metadata, or an error status
+    pub async fn handle_request(
+        // TODO: This may cause problems. May need reintroduction of Mutex or some other mechanism
+        &mut self,
+        service_name: &str,
+        method_name: &str,
+        request: tonic::Request<tonic::body::Body>
+    ) -> Result<tonic::Response<tonic::body::Body>, Status> {
+        // Reverse iteration to check most recent first
+        let matching_handlers = self.handlers.iter_mut().rev().filter(|h| h.service_name == service_name && h.method_name == method_name);
+        let (meta, ext, bod) = request.into_parts();
+        let collect = bod.collect();
+        let collected = collect.await.unwrap();
+        let full = Full::new(collected.to_bytes());
+
+        let mut handler_result: Option<(&BetterMockHandler, Result<_, Status>)> = None;
+        for handler in matching_handlers {
+            let new_body = tonic::body::Body::new(full.clone());
+            let cloned_request = tonic::Request::from_parts(meta.clone(), ext.clone(), new_body);
+            handler_result = match handler.inner.call(cloned_request).await {
+                // TODO: Turn this string into a const
+                Err(status) if status.message() == "__TONIC_MOCK_PREDICATE_SKIP__" => continue,
+                r @ Err(_) | r @ Ok(_) => Some((handler, r)),
+            };
+
+            if handler_result.is_some() {
+                break;
+            }
+        }
+
+        let (matched_handler, result) = match handler_result {
+            Some(r) => r,
+            None => return Err(Status::unimplemented(format!(
+                "No mock handler configured for {}::{}",
+                service_name, method_name
+            ))),
+        };
+
+        if let Some(delay) = matched_handler.delay {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        result
+    }
 
     /// Register a handler function for a specific service and method
-    async fn register_better_handler<F>(&self, service_name: String, method_name: String, handler: F)
-    where
-    F: Fn(Box<dyn Message>) -> Box<dyn Future<Output = Result<Box<dyn Message>, Status>>>
+    async fn register_handler(&mut self, handler: BetterMockHandler)
     {
-        let mut better_handlers = self.better_handlers.lock().unwrap();
-        better_handlers.push(BetterMockHandler{service_name,method_name,service:         Box::new(tower::util::service_fn(Box::new(handler)))})
+        self.handlers.push(handler);
+    }
+}
+
+// This trait bound is as broad as possilbe to hopefully fit many blanket impls
+impl tonic::codegen::Service<tonic::Request<tonic::body::Body>> for BetterMockableGrpcClient where
+{
+    type Response = http::response::Response<tonic::body::Body>;
+    // TODO: may not satisfy into stderror constraint
+    type Error = Status;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: tonic::Request<tonic::body::Body>) -> Self::Future {
+        let grpc = request.extensions().get::<GrpcMethod>().expect("GrpcMethod Extension missing").clone();
+        let service_name = grpc.service().to_string();
+        let method_name = grpc.method().to_string();
+
+        let result = self.handle_request(&service_name, &method_name, request).boxed();
+
+        result
     }
 }
 
@@ -634,7 +733,7 @@ where
 
 impl<Req, Resp> MockBuilder<Req, Resp>
 where
-    Req: Message + Default + 'static,
+    Req: Message + Default + std::fmt::Debug + 'static,
     Resp: Message + Default + Clone + 'static,
 {
     /// Configure a static response for any request
