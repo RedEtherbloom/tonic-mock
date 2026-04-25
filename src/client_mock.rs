@@ -214,7 +214,7 @@ use std::{
     marker::PhantomData, sync::{Arc, Mutex}, time::Duration
 };
 use tokio::{sync::{RwLock, TryLockError}, time::sleep};
-use tonic::{GrpcMethod, Status, codec::{Codec, EncodeBody}, metadata::MetadataMap};
+use tonic::{GrpcMethod, Status, codec::{Codec, CompressionEncoding, EncodeBody}, metadata::MetadataMap};
 use tonic::codegen::BoxFuture;
 use tower::{Service, service_fn};
 use http_body_util::{BodyExt, Full};
@@ -389,6 +389,11 @@ pub struct BetterMockResponseDefinition<Resp> {
     pub metadata_pairs: MetadataMap,
     /// Delay before responding (simulates network latency)
     pub delay_ms: Option<u64>,
+
+    // Options to pass to the ProstCodec
+    compression_encoding: Option<CompressionEncoding>,
+    max_message_size: Option<usize>,
+
 }
 
 impl<Resp> Default for BetterMockResponseDefinition<Resp> {
@@ -397,6 +402,8 @@ impl<Resp> Default for BetterMockResponseDefinition<Resp> {
             response: Err(Status::unimplemented("Default Mock response definition was given")),
             metadata_pairs: MetadataMap::new(),
             delay_ms: None,
+            compression_encoding: None,
+            max_message_size: None,
         }
     }
 }
@@ -949,23 +956,22 @@ where
         let response_clone = response_def.clone();
 
         let handler_fn = move | _request: tonic::Request<tonic::body::Body>| {
-        let encoder = ProstCodec::<Resp, Resp>::default().encoder();
             let response_def = response_def.clone();
 
-            let function= async move  {
-            let response_message: Resp = match response_def.response {
-                Err(status) => return Err(status),
-                Ok(msg) => msg,
-            };
+            let function: Box<dyn Future<Output = Result < tonic::Response<tonic::body::Body>, Status>> + Send + 'static> = Box::new(async move  {
+                let response_message: Resp = match response_def.response {
+                    Err(status) => return Err(status),
+                    Ok(msg) => msg,
+                };
 
-            // TODO: Pass compression and message size from e.g. response def
-            let encoded = EncodeBody::new_client(encoder, tonic::codegen::tokio_stream::once(Ok(response_message)), None, None);
-            // TODO: Add headers in here
+                let encoder = ProstCodec::<Resp, Resp>::default().encoder();
+                let encoded_body = tonic::body::Body::new(EncodeBody::new_client(encoder, tonic::codegen::tokio_stream::once(Ok(response_message)), response_def.compression_encoding, response_def.max_message_size));
+                let response = tonic::Response::from_parts(response_def.metadata_pairs.clone(), encoded_body, tonic::codegen::http::Extensions::new());
 
-            return Ok(tonic::Response::new(tonic::body::Body::new(encoded)))
-            };
-            let boxed: Box<dyn Future<Output = Result < tonic::Response<tonic::body::Body>, Status>> + Send + 'static> = Box::new(function);
-            Box::into_pin(boxed)
+                Ok(response)
+            });
+            // Constructed in two steps to coerce the correct type
+            Box::into_pin(function)
         };
 
         let handler = BetterMockHandler {
