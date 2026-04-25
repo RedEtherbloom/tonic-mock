@@ -207,16 +207,16 @@ mock.reset().await;
 */
 
 use bytes::Bytes;
-use futures::FutureExt;
 use http::{HeaderMap, HeaderName, header::HeaderValue};
 use prost::Message;
+use tonic_prost::ProstCodec;
 use std::{
     marker::PhantomData, sync::{Arc, Mutex}, time::Duration
 };
-use tokio::time::sleep;
-use tonic::{GrpcMethod, Status, metadata::MetadataMap};
+use tokio::{sync::{RwLock, TryLockError}, time::sleep};
+use tonic::{GrpcMethod, Status, codec::{Codec, EncodeBody}, metadata::MetadataMap};
 use tonic::codegen::BoxFuture;
-use tower::Service;
+use tower::{Service, service_fn};
 use http_body_util::{BodyExt, Full};
 
 use crate::grpc_mock::{decode_grpc_message, encode_grpc_response};
@@ -380,6 +380,27 @@ fn create_headers_from_def<Resp: Clone>(response_def: &MockResponseDefinition<Re
     headers
 }
 
+/// Predefined response for a mock gRPC service
+#[derive(Clone, Debug)]
+pub struct BetterMockResponseDefinition<Resp> {
+    // Response or Status to return
+    pub response: Result<Resp, Status>,
+    /// Additional metadata as key-value pairs
+    pub metadata_pairs: MetadataMap,
+    /// Delay before responding (simulates network latency)
+    pub delay_ms: Option<u64>,
+}
+
+impl<Resp> Default for BetterMockResponseDefinition<Resp> {
+    fn default() -> Self {
+        Self {
+            response: Err(Status::unimplemented("Default Mock response definition was given")),
+            metadata_pairs: MetadataMap::new(),
+            delay_ms: None,
+        }
+    }
+}
+
 /// Type alias for a predicate function
 type PredicateFn<Req> = Arc<dyn Fn(&Req) -> bool + Send + Sync>;
 
@@ -433,9 +454,15 @@ pub struct MockableGrpcClient {
     handlers: Arc<Mutex<Vec<MockHandler>>>,
 }
 
-#[derive(Default)]
+// TODO: Impl Debug
+#[derive(Clone, Default)]
 pub struct BetterMockableGrpcClient {
-    handlers: Vec<BetterMockHandler>,
+    // Explanation of type:
+    // 1. Arc: Allow cloning the client for MockResponseBuilder pattern
+    // 2. RwLock: Allow updating the handlers without having to drop every previous Handler and all references to them(think e.g. a test struct that has Client as a field)
+    // 3. Vec: Vec of handlers
+    // 4. Smart pointer to handlers to limit life times problems with e.g. handling the list of mocks in a 'static Future
+    handlers: Arc<RwLock<Vec<Arc<BetterMockHandler>>>>,
 }
 
 /// Abstract handler type that doesn't expose generic parameters
@@ -448,19 +475,17 @@ enum MockHandler {
     },
 }
 
-// TODO: Debug impl
+// TODO: Impl Debug
 struct BetterMockHandler {
     pub service_name: String,
     pub method_name: String,
-    // TODO: Turn into an either or
+    // TODO: Turn into a ref to the MockResponseDefinition
     /// Additional metadata as key-value pairs
     pub metadata: MetadataMap,
     /// Delay in ms before responding (simulates network latency)
     pub delay: Option<u64>,
 
-    // TODO: Constrain to Send + Sync
-    // TODO: Turn into service
-    pub inner: Box<dyn Service<tonic::Request<tonic::body::Body>, Response = tonic::Response<tonic::body::Body>, Error = Status, Future = BoxFuture<tonic::Response<tonic::body::Body>, Status>> + Send + Sync>,
+    pub inner: tokio::sync::Mutex<Box<dyn Service<tonic::Request<tonic::body::Body>, Response = tonic::Response<tonic::body::Body>, Error = Status, Future = BoxFuture<tonic::Response<tonic::body::Body>, Status>> + Send + Sync>>,
 }
 
 // TODO: Impl from MockResponseDefinition
@@ -628,78 +653,32 @@ impl BetterMockableGrpcClient {
         Self::default()
     }
 
-    pub fn reset(&mut self) {
-        self.handlers.clear();
+    pub fn reset(&mut self) -> Result<(), TryLockError> {
+        self.handlers.try_write()?.clear();
+
+        Ok(())
     }
 
-    /// Handle a gRPC request
-    ///
-    /// This method is used internally by client implementations to handle
-    /// mock requests. It looks up the appropriate handler for the service
-    /// and method and delegates to it.
-    ///
-    /// # Arguments
-    /// * `service_name` - The name of the gRPC service
-    /// * `method_name` - The name of the method being called
-    /// * `request_bytes` - The encoded request message
-    ///
-    /// # Returns
-    /// The encoded response and any metadata, or an error status
-    pub async fn handle_request(
-        // TODO: This may cause problems. May need reintroduction of Mutex or some other mechanism
-        &mut self,
-        service_name: &str,
-        method_name: &str,
-        request: tonic::Request<tonic::body::Body>
-    ) -> Result<tonic::Response<tonic::body::Body>, Status> {
-        // Reverse iteration to check most recent first
-        let matching_handlers = self.handlers.iter_mut().rev().filter(|h| h.service_name == service_name && h.method_name == method_name);
-        let (meta, ext, bod) = request.into_parts();
-        let collect = bod.collect();
-        let collected = collect.await.unwrap();
-        let full = Full::new(collected.to_bytes());
+    fn get_handlers(&self, service_name: &str, method_name: &str) -> Result<Vec<Arc<BetterMockHandler>>, TryLockError> {
+        let matching_handlers = self.handlers.try_read()?.iter().rev().filter(|h| h.service_name == service_name && h.method_name == method_name).cloned().collect();
 
-        let mut handler_result: Option<(&BetterMockHandler, Result<_, Status>)> = None;
-        for handler in matching_handlers {
-            let new_body = tonic::body::Body::new(full.clone());
-            let cloned_request = tonic::Request::from_parts(meta.clone(), ext.clone(), new_body);
-            handler_result = match handler.inner.call(cloned_request).await {
-                // TODO: Turn this string into a const
-                Err(status) if status.message() == "__TONIC_MOCK_PREDICATE_SKIP__" => continue,
-                r @ Err(_) | r @ Ok(_) => Some((handler, r)),
-            };
-
-            if handler_result.is_some() {
-                break;
-            }
-        }
-
-        let (matched_handler, result) = match handler_result {
-            Some(r) => r,
-            None => return Err(Status::unimplemented(format!(
-                "No mock handler configured for {}::{}",
-                service_name, method_name
-            ))),
-        };
-
-        if let Some(delay) = matched_handler.delay {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-
-        result
+        Ok(matching_handlers)
     }
 
+    /// TODO: Try an awaited write instead
     /// Register a handler function for a specific service and method
-    async fn register_handler(&mut self, handler: BetterMockHandler)
-    {
-        self.handlers.push(handler);
+    async fn register_handler(&self, handler: BetterMockHandler) -> Result<Arc<BetterMockHandler>, TryLockError> {
+        let handler_ref = Arc::new(handler);
+        self.handlers.try_write()?.push(handler_ref.clone());
+
+        Ok(handler_ref)
     }
 }
 
 // This trait bound is as broad as possilbe to hopefully fit many blanket impls
 impl tonic::codegen::Service<tonic::Request<tonic::body::Body>> for BetterMockableGrpcClient where
 {
-    type Response = http::response::Response<tonic::body::Body>;
+    type Response = tonic::Response<tonic::body::Body>;
     // TODO: may not satisfy into stderror constraint
     type Error = Status;
     type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
@@ -710,12 +689,48 @@ impl tonic::codegen::Service<tonic::Request<tonic::body::Body>> for BetterMockab
 
     fn call(&mut self, request: tonic::Request<tonic::body::Body>) -> Self::Future {
         let grpc = request.extensions().get::<GrpcMethod>().expect("GrpcMethod Extension missing").clone();
-        let service_name = grpc.service().to_string();
-        let method_name = grpc.method().to_string();
 
-        let result = self.handle_request(&service_name, &method_name, request).boxed();
+        let matching_handlers = self.get_handlers(grpc.service(), grpc.method());
 
-        result
+        Box::pin(async move {
+        let matching_handlers = match matching_handlers{
+            Ok(o ) => o,
+            // Err(e) => return Status::internal(format!("Could not acquire read lock: {e:#?}")),
+            Err(e) => return Err(Status::internal(format!("Could not acquire read lock: {e:#?}"))),
+        };
+
+        let (metadata, extensions, body) = request.into_parts();
+        let full = Full::new(body.collect().await.unwrap().to_bytes());
+
+            let mut handler_result: Option<(Arc<BetterMockHandler>, Result<tonic::Response<tonic::body::Body>, Status>)> = None;
+        for handler in matching_handlers {
+            let cloned_request = tonic::Request::from_parts(metadata.clone(), extensions.clone(), tonic::body::Body::new(full.clone()));
+            handler_result = match handler.inner.lock().await.call(cloned_request).await {
+                // TODO: Turn this string into a const, or enum perhaps
+                Err(status) if status.message() == "__TONIC_MOCK_PREDICATE_SKIP__" => continue,
+                r @ Err(_) | r @ Ok(_) => Some((handler.clone(), r)),
+            };
+
+            if handler_result.is_some() {
+                break;
+            }
+        }
+
+            let (handler, result) = match handler_result {
+                Some(o) => o,
+                None => return Err(Status::unimplemented(format!(
+            "No mock handler configured for {}::{}",
+            grpc.service(), grpc.method()
+                ))),
+            };
+
+            if let Some(delay) = handler.delay {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+
+            result
+
+        })
     }
 }
 
@@ -907,6 +922,114 @@ where
         self.client
             .register_handler(service_name, method_name, handler)
             .await;
+
+        self
+    }
+}
+
+
+/// Builder for configuring mock responses
+pub struct BetterMockBuilder<Req, Resp>
+where
+    Req: Message + Default + 'static,
+    Resp: Message + Default + Clone + 'static,
+{
+    client: BetterMockableGrpcClient,
+    service_name: String,
+    method_name: String,
+    _marker: PhantomData<(Req, Resp)>,
+}
+
+impl<Req, Resp> BetterMockBuilder<Req, Resp>
+where
+    Req: Message + std::fmt::Debug + Default + 'static,
+    Resp: Message + Default + Clone + 'static,
+{
+    pub async fn respond_with(self, response_def: BetterMockResponseDefinition<Resp>) -> Result<Self, TryLockError> {
+        let response_clone = response_def.clone();
+
+        let handler_fn = move | _request: tonic::Request<tonic::body::Body>| {
+        let encoder = ProstCodec::<Resp, Resp>::default().encoder();
+            let response_def = response_def.clone();
+
+            let function= async move  {
+            let response_message: Resp = match response_def.response {
+                Err(status) => return Err(status),
+                Ok(msg) => msg,
+            };
+
+            // TODO: Pass compression and message size from e.g. response def
+            let encoded = EncodeBody::new_client(encoder, tonic::codegen::tokio_stream::once(Ok(response_message)), None, None);
+            // TODO: Add headers in here
+
+            return Ok(tonic::Response::new(tonic::body::Body::new(encoded)))
+            };
+            let boxed: Box<dyn Future<Output = Result < tonic::Response<tonic::body::Body>, Status>> + Send + 'static> = Box::new(function);
+            Box::into_pin(boxed)
+        };
+
+        let handler = BetterMockHandler {
+            service_name: self.service_name.clone(),
+            method_name: self.method_name.clone(),
+            metadata: response_clone.metadata_pairs,
+            delay: response_clone.delay_ms,
+            inner: tokio::sync::Mutex::new(Box::new(service_fn(handler_fn))),
+        };
+        self.client
+            .register_handler(handler)
+            .await?;
+
+        Ok(self)
+    }
+
+    pub async fn respond_when<F>(
+        self,
+        predicate: F,
+        response_def: MockResponseDefinition<Resp>,
+    ) -> Self
+    where
+        F: Fn(&Req) -> bool + Send + Sync + 'static,
+    {
+        let service_name = self.service_name.clone();
+        let method_name = self.method_name.clone();
+        let predicate = Arc::new(predicate) as PredicateFn<Req>;
+        let response_clone = response_def.clone();
+
+        let handler = move |request_bytes: &[u8]| {
+            // First decode the request
+            let req: Req = match decode_grpc_message(request_bytes) {
+                Ok(req) => req,
+                Err(status) => return Err(status),
+            };
+
+            // Check if the predicate matches
+            if !predicate(&req) {
+                // Return a special status that signals to skip this handler
+                return Err(Status::internal("__TONIC_MOCK_PREDICATE_SKIP__"));
+            }
+
+            // Create the response based on the definition
+            if let Some(status) = &response_clone.status {
+                // Error response
+                return Err(status.clone());
+            }
+
+            if let Some(response) = &response_clone.response {
+                // Success response
+                let response_bytes = encode_grpc_response(response.clone());
+                let headers = create_headers_from_def(&response_clone);
+                return Ok((response_bytes, headers));
+            }
+
+            // In theory shouldn't happen if the ResponseDefinition is properly constructed
+            Err(Status::internal(
+                "Invalid MockResponseDefinition: both response and status are None",
+            ))
+        };
+
+        // self.client
+        //     .register_handler(service_name, method_name, handler)
+        //     .await;
 
         self
     }
