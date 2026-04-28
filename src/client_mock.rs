@@ -207,19 +207,21 @@ mock.reset().await;
 */
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, header::HeaderValue};
+use http::{HeaderMap, HeaderName, StatusCode, header::HeaderValue};
 use prost::Message;
 use tonic_prost::ProstCodec;
 use std::{
-    marker::PhantomData, sync::{Arc, Mutex}, time::Duration
+    default, marker::PhantomData, sync::{Arc, Mutex}, time::Duration
 };
 use tokio::{sync::{RwLock, TryLockError}, time::sleep};
-use tonic::{GrpcMethod, Status, codec::{Codec, CompressionEncoding, EncodeBody}, metadata::MetadataMap};
+use tonic::{GrpcMethod, Status, Streaming, codec::{Codec, CompressionEncoding, EncodeBody}, metadata::MetadataMap};
 use tonic::codegen::BoxFuture;
 use tower::{Service, service_fn};
 use http_body_util::{BodyExt, Full};
 
 use crate::grpc_mock::{decode_grpc_message, encode_grpc_response};
+
+pub const MOCK_PREDICATE_SKIP: &'static str = "__TONIC_MOCK_PREDICATE_SKIP__";
 
 /// Predefined response for a mock gRPC service
 #[derive(Clone)]
@@ -385,6 +387,7 @@ fn create_headers_from_def<Resp: Clone>(response_def: &MockResponseDefinition<Re
 pub struct BetterMockResponseDefinition<Resp> {
     // Response or Status to return
     pub response: Result<Resp, Status>,
+    // TODO: Check if this should be MetadataMap or HeaderMap
     /// Additional metadata as key-value pairs
     pub metadata_pairs: MetadataMap,
     /// Delay before responding (simulates network latency)
@@ -949,24 +952,78 @@ where
 
 impl<Req, Resp> BetterMockBuilder<Req, Resp>
 where
-    Req: Message + std::fmt::Debug + Default + 'static,
+    Req: Message + Default + 'static,
     Resp: Message + Default + Clone + 'static,
 {
     pub async fn respond_with(self, response_def: BetterMockResponseDefinition<Resp>) -> Result<Self, TryLockError> {
+        let stub_predicate = async move |_request: Req | -> bool {
+            false
+        };
+        // TODO: WRONG TAKE
+        let mut wrapped_stub_predicate = Some(stub_predicate);
+        let _dropped_value = wrapped_stub_predicate.take();
+        self.respond_when(wrapped_stub_predicate, response_def).await
+    }
+
+    // TODO: Alias to respond_when_async_fn
+    pub async fn respond_when<F, Fut>(
+        self,
+        // TODO: This should be a Box<dyn> because, iirc, the compiler would duplicate this function for every closure/closure type
+        predicate: Option<F>,
+        response_def: BetterMockResponseDefinition<Resp>,
+    ) -> Result<Self, TryLockError>
+    where
+        F: Fn(Req) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send,
+    {
+        let predicate = predicate.map(Arc::new);
         let response_clone = response_def.clone();
 
-        let handler_fn = move | _request: tonic::Request<tonic::body::Body>| {
+        let handler_fn = move |request: tonic::Request<tonic::body::Body>| {
             let response_def = response_def.clone();
+            let predicate = predicate.clone();
 
-            let function: Box<dyn Future<Output = Result < tonic::Response<tonic::body::Body>, Status>> + Send + 'static> = Box::new(async move  {
-                let response_message: Resp = match response_def.response {
-                    Err(status) => return Err(status),
-                    Ok(msg) => msg,
-                };
+            let function: Box<
+                dyn Future<Output = Result<tonic::Response<tonic::body::Body>, Status>>
+                    + Send
+                    + 'static,
+            > = Box::new(async move {
+                let mut codec = ProstCodec::<Resp, Req>::default();
+                if let Some(predicate_fn) = predicate {
+                    let mut streaming = Streaming::new_response(
+                        codec.decoder(),
+                        request.into_inner(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        response_def.compression_encoding,
+                        response_def.max_message_size,
+                    );
+                    let message = match streaming.message().await {
+                        Err(status) => Err(status), // There was an error decoding the message
+                        Ok(None) => Err(Status::internal(
+                            "Expected to decode Message, but Stream only returned None",
+                        )), // Something went wrong with the stream
+                        Ok(Some(o)) => Ok(o),
+                    }?;
 
-                let encoder = ProstCodec::<Resp, Resp>::default().encoder();
-                let encoded_body = tonic::body::Body::new(EncodeBody::new_client(encoder, tonic::codegen::tokio_stream::once(Ok(response_message)), response_def.compression_encoding, response_def.max_message_size));
-                let response = tonic::Response::from_parts(response_def.metadata_pairs.clone(), encoded_body, tonic::codegen::http::Extensions::new());
+                    if let continue_processing = predicate_fn(message).await
+                        && !continue_processing
+                    {
+                        return Err(Status::internal(MOCK_PREDICATE_SKIP));
+                    }
+                }
+
+                let response_message: Resp = response_def.response?;
+                let encoded_body = tonic::body::Body::new(EncodeBody::new_client(
+                    codec.encoder(),
+                    tonic::codegen::tokio_stream::once(Ok(response_message)),
+                    response_def.compression_encoding,
+                    response_def.max_message_size,
+                ));
+                let response = tonic::Response::from_parts(
+                    response_def.metadata_pairs.clone(),
+                    encoded_body,
+                    tonic::codegen::http::Extensions::new(),
+                );
 
                 Ok(response)
             });
@@ -981,63 +1038,10 @@ where
             delay: response_clone.delay_ms,
             inner: tokio::sync::Mutex::new(Box::new(service_fn(handler_fn))),
         };
-        self.client
-            .register_handler(handler)
-            .await?;
+
+        self.client.register_handler(handler).await?;
 
         Ok(self)
-    }
-
-    pub async fn respond_when<F>(
-        self,
-        predicate: F,
-        response_def: MockResponseDefinition<Resp>,
-    ) -> Self
-    where
-        F: Fn(&Req) -> bool + Send + Sync + 'static,
-    {
-        let service_name = self.service_name.clone();
-        let method_name = self.method_name.clone();
-        let predicate = Arc::new(predicate) as PredicateFn<Req>;
-        let response_clone = response_def.clone();
-
-        let handler = move |request_bytes: &[u8]| {
-            // First decode the request
-            let req: Req = match decode_grpc_message(request_bytes) {
-                Ok(req) => req,
-                Err(status) => return Err(status),
-            };
-
-            // Check if the predicate matches
-            if !predicate(&req) {
-                // Return a special status that signals to skip this handler
-                return Err(Status::internal("__TONIC_MOCK_PREDICATE_SKIP__"));
-            }
-
-            // Create the response based on the definition
-            if let Some(status) = &response_clone.status {
-                // Error response
-                return Err(status.clone());
-            }
-
-            if let Some(response) = &response_clone.response {
-                // Success response
-                let response_bytes = encode_grpc_response(response.clone());
-                let headers = create_headers_from_def(&response_clone);
-                return Ok((response_bytes, headers));
-            }
-
-            // In theory shouldn't happen if the ResponseDefinition is properly constructed
-            Err(Status::internal(
-                "Invalid MockResponseDefinition: both response and status are None",
-            ))
-        };
-
-        // self.client
-        //     .register_handler(service_name, method_name, handler)
-        //     .await;
-
-        self
     }
 }
 
