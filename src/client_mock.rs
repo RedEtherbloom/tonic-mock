@@ -211,12 +211,12 @@ use http::{HeaderMap, HeaderName, StatusCode, header::HeaderValue};
 use prost::Message;
 use tonic_prost::ProstCodec;
 use std::{
-    default, marker::PhantomData, sync::{Arc, Mutex}, time::Duration
+    default, marker::PhantomData, pin::Pin, sync::{Arc, Mutex, Weak}, time::Duration
 };
 use tokio::{sync::{RwLock, TryLockError}, time::sleep};
 use tonic::{GrpcMethod, Status, Streaming, codec::{Codec, CompressionEncoding, EncodeBody}, metadata::MetadataMap};
 use tonic::codegen::BoxFuture;
-use tower::{Service, service_fn};
+use tower::{Service, service_fn, util::BoxService};
 use http_body_util::{BodyExt, Full};
 
 use crate::grpc_mock::{decode_grpc_message, encode_grpc_response};
@@ -392,11 +392,6 @@ pub struct BetterMockResponseDefinition<Resp> {
     pub metadata_pairs: MetadataMap,
     /// Delay before responding (simulates network latency)
     pub delay_ms: Option<u64>,
-
-    // Options to pass to the ProstCodec
-    compression_encoding: Option<CompressionEncoding>,
-    max_message_size: Option<usize>,
-
 }
 
 impl<Resp> Default for BetterMockResponseDefinition<Resp> {
@@ -405,8 +400,6 @@ impl<Resp> Default for BetterMockResponseDefinition<Resp> {
             response: Err(Status::unimplemented("Default Mock response definition was given")),
             metadata_pairs: MetadataMap::new(),
             delay_ms: None,
-            compression_encoding: None,
-            max_message_size: None,
         }
     }
 }
@@ -494,8 +487,12 @@ struct BetterMockHandler {
     pub metadata: MetadataMap,
     /// Delay in ms before responding (simulates network latency)
     pub delay: Option<u64>,
+    // Metadata for ProstCodec
+    pub compression_encoding: Option<CompressionEncoding>,
+    pub max_message_size: Option<usize>,
 
-    pub inner: tokio::sync::Mutex<Box<dyn Service<tonic::Request<tonic::body::Body>, Response = tonic::Response<tonic::body::Body>, Error = Status, Future = BoxFuture<tonic::Response<tonic::body::Body>, Status>> + Send + Sync>>,
+    // TODO: Use BoxService instead
+    pub inner: tokio::sync::Mutex<BoxService<tonic::Request<tonic::body::Body>, tonic::Response<tonic::body::Body>, Status>>,
 }
 
 // TODO: Impl from MockResponseDefinition
@@ -677,11 +674,10 @@ impl BetterMockableGrpcClient {
 
     /// TODO: Try an awaited write instead
     /// Register a handler function for a specific service and method
-    async fn register_handler(&self, handler: BetterMockHandler) -> Result<Arc<BetterMockHandler>, TryLockError> {
-        let handler_ref = Arc::new(handler);
-        self.handlers.try_write()?.push(handler_ref.clone());
+    async fn register_handler(&self, handler: Arc<BetterMockHandler>) -> Result<Arc<BetterMockHandler>, TryLockError> {
+        self.handlers.try_write()?.push(handler.clone());
 
-        Ok(handler_ref)
+        Ok(handler)
     }
 }
 
@@ -947,6 +943,10 @@ where
     client: BetterMockableGrpcClient,
     service_name: String,
     method_name: String,
+    // Options to pass to the ProstCodec
+    compression_encoding: Option<CompressionEncoding>,
+    max_message_size: Option<usize>,
+
     _marker: PhantomData<(Req, Resp)>,
 }
 
@@ -955,47 +955,70 @@ where
     Req: Message + Default + 'static,
     Resp: Message + Default + Clone + 'static,
 {
+    fn set_compression_encoding(&mut self, encoding: CompressionEncoding) {
+        self.compression_encoding = Some(encoding);
+    }
+
+    fn set_max_message_size(&mut self, max_size: usize) {
+        self.max_message_size = Some(max_size);
+    }
+
     pub async fn respond_with(self, response_def: BetterMockResponseDefinition<Resp>) -> Result<Self, TryLockError> {
-        let stub_predicate = async move |_request: Req | -> bool {
+        let stub_predicate = Box::pin(async |_request: &Req | -> bool {
             false
-        };
-        // TODO: WRONG TAKE
+        });
         let mut wrapped_stub_predicate = Some(stub_predicate);
         let _dropped_value = wrapped_stub_predicate.take();
         self.respond_when(wrapped_stub_predicate, response_def).await
     }
 
-    // TODO: Alias to respond_when_async_fn
     pub async fn respond_when<F, Fut>(
         self,
-        // TODO: This should be a Box<dyn> because, iirc, the compiler would duplicate this function for every closure/closure type
-        predicate: Option<F>,
+        predicate: Option<Pin<Box<F>>>,
         response_def: BetterMockResponseDefinition<Resp>,
     ) -> Result<Self, TryLockError>
     where
-        F: Fn(Req) -> Fut + Send + Sync + 'static,
+        F: Fn(&Req) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = bool> + Send,
     {
         let predicate = predicate.map(Arc::new);
         let response_clone = response_def.clone();
 
-        let handler_fn = move |request: tonic::Request<tonic::body::Body>| {
+        let handler = Arc::new_cyclic(|weak: &Weak<BetterMockHandler>|
+{
+            let weak = weak.clone();
+BetterMockHandler {
+            service_name: self.service_name.clone(),
+            method_name: self.method_name.clone(),
+            metadata: response_clone.metadata_pairs,
+            delay: response_clone.delay_ms,
+            max_message_size: self.max_message_size.clone(),
+            compression_encoding: self.compression_encoding.clone(),
+    inner: tokio::sync::Mutex::new(BoxService::new(service_fn(
+
+        move |request: tonic::Request<tonic::body::Body>| {
             let response_def = response_def.clone();
             let predicate = predicate.clone();
+            let weak = weak.clone();
+
 
             let function: Box<
                 dyn Future<Output = Result<tonic::Response<tonic::body::Body>, Status>>
                     + Send
                     + 'static,
             > = Box::new(async move {
+                let handler = match weak.upgrade() {
+                    Some(handler) => handler,
+                    None => return Err(Status::failed_precondition("Associated handler has been dropped")),
+                };
                 let mut codec = ProstCodec::<Resp, Req>::default();
                 if let Some(predicate_fn) = predicate {
                     let mut streaming = Streaming::new_response(
                         codec.decoder(),
                         request.into_inner(),
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        response_def.compression_encoding,
-                        response_def.max_message_size,
+                        handler.compression_encoding,
+                        handler.max_message_size,
                     );
                     let message = match streaming.message().await {
                         Err(status) => Err(status), // There was an error decoding the message
@@ -1005,7 +1028,7 @@ where
                         Ok(Some(o)) => Ok(o),
                     }?;
 
-                    if let continue_processing = predicate_fn(message).await
+                    if let continue_processing = predicate_fn(&message).await
                         && !continue_processing
                     {
                         return Err(Status::internal(MOCK_PREDICATE_SKIP));
@@ -1016,11 +1039,11 @@ where
                 let encoded_body = tonic::body::Body::new(EncodeBody::new_client(
                     codec.encoder(),
                     tonic::codegen::tokio_stream::once(Ok(response_message)),
-                    response_def.compression_encoding,
-                    response_def.max_message_size,
+                    handler.compression_encoding,
+                    handler.max_message_size,
                 ));
                 let response = tonic::Response::from_parts(
-                    response_def.metadata_pairs.clone(),
+                    handler.metadata.clone(),
                     encoded_body,
                     tonic::codegen::http::Extensions::new(),
                 );
@@ -1029,20 +1052,92 @@ where
             });
             // Constructed in two steps to coerce the correct type
             Box::into_pin(function)
-        };
+        }))),
+}});
+        // handler.inner = tokio::sync::Mutex::new(BoxService::new(service_fn(handler_fn)));
 
-        let handler = BetterMockHandler {
-            service_name: self.service_name.clone(),
-            method_name: self.method_name.clone(),
-            metadata: response_clone.metadata_pairs,
-            delay: response_clone.delay_ms,
-            inner: tokio::sync::Mutex::new(Box::new(service_fn(handler_fn))),
-        };
 
         self.client.register_handler(handler).await?;
 
         Ok(self)
     }
+
+    // pub async fn respond_when_with_fn<F, G, PredicateFut, FunctionFut>(
+    //     self,
+    //     predicate: Option<Box<F>>,
+    //     response_fn: Box<G>,
+    // ) -> Result<Self, TryLockError>
+    // where
+    //     F: Fn(&Req) -> PredicateFut + Send + Sync + 'static,
+    //     PredicateFut: Future<Output = bool> + Send,
+    //     G: Fn(Req) -> FunctionFut + Send + Sync + 'static,
+    //     FunctionFut: Future<Output = Result<Resp, Status>> + Send,
+    // {
+    //     let predicate = predicate.map(Arc::new);
+
+    //     let handler_fn = move |request: tonic::Request<tonic::body::Body>| {
+    //         let predicate = predicate.clone();
+
+    //         let function: Box<
+    //             dyn Future<Output = Result<tonic::Response<tonic::body::Body>, Status>>
+    //                 + Send
+    //                 + 'static,
+    //         > = Box::new(async move {
+    //             let mut codec = ProstCodec::<Resp, Req>::default();
+    //             if let Some(predicate_fn) = predicate {
+    //                 let mut streaming = Streaming::new_response(
+    //                     codec.decoder(),
+    //                     request.into_inner(),
+    //                     StatusCode::INTERNAL_SERVER_ERROR,
+    //                     self.compression_encoding,
+    //                     self.max_message_size,
+    //                 );
+    //                 let message = match streaming.message().await {
+    //                     Err(status) => Err(status), // There was an error decoding the message
+    //                     Ok(None) => Err(Status::internal(
+    //                         "Expected to decode Message, but Stream only returned None",
+    //                     )), // Something went wrong with the stream
+    //                     Ok(Some(o)) => Ok(o),
+    //                 }?;
+
+    //                 if let continue_processing = predicate_fn(message).await
+    //                     && !continue_processing
+    //                 {
+    //                     return Err(Status::internal(MOCK_PREDICATE_SKIP));
+    //                 }
+    //             }
+
+    //             let response_message: Resp = response_def.response?;
+    //             let encoded_body = tonic::body::Body::new(EncodeBody::new_client(
+    //                 codec.encoder(),
+    //                 tonic::codegen::tokio_stream::once(Ok(response_message)),
+    //                 self.compression_encoding,
+    //                 self.max_message_size,
+    //             ));
+    //             let response = tonic::Response::from_parts(
+    //                 response_def.metadata_pairs.clone(),
+    //                 encoded_body,
+    //                 tonic::codegen::http::Extensions::new(),
+    //             );
+
+    //             Ok(response)
+    //         });
+    //         // Constructed in two steps to coerce the correct type
+    //         Box::into_pin(function)
+    //     };
+
+    //     let handler = BetterMockHandler {
+    //         service_name: self.service_name.clone(),
+    //         method_name: self.method_name.clone(),
+    //         metadata: response_clone.metadata_pairs,
+    //         delay: response_clone.delay_ms,
+    //         inner: tokio::sync::Mutex::new(Box::new(service_fn(handler_fn))),
+    //     };
+
+    //     self.client.register_handler(handler).await?;
+
+    //     Ok(self)
+    // }
 }
 
 /// Extension trait for gRPC clients to support mocking
